@@ -53,3 +53,5 @@ PROMPTS.md
 *.csv
 train.ipynb
 better.md
+*.png
+catboost_info/

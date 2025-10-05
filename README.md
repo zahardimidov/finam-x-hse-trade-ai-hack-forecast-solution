@@ -116,7 +116,3 @@ ticker,p1,p2,p3,...,p20
 * **Предобработка:** индикаторы для свечей, сопоставление новостей с тикерами, TF-IDF + SVD, новизна новостей.
 * **Модель:** прогноз доходностей на горизонты 1–20 дней.
 * **Выход:** CSV с предсказаниями, совместимый с оценочным скриптом.
-# finam-x-hse-trade-ai-hack-forecast-solution
-# finam-x-hse-trade-ai-hack-forecast-solution
-# finam-x-hse-trade-ai-hack-forecast-solution
-# finam-x-hse-trade-ai-hack-forecast-solution

@@ -2,8 +2,8 @@ import argparse
 import os
 import warnings
 
-import lightgbm as lgb
 import pandas as pd
+from catboost import CatBoostRegressor
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 
@@ -17,14 +17,17 @@ SEED = 42
 
 class AiForecast:
     def __init__(self, artifact_dir="./artifacts"):
-        self.model_1 = None
-        self.model_20 = None
+        self.model = None
 
         self.artifact_dir = artifact_dir
 
-    def load_models(self, model_1_path: str, model_20_path: str):
-        self.model_1 = lgb.Booster(model_file=model_1_path)
-        self.model_20 = lgb.Booster(model_file=model_20_path)
+    def load_model(self, model_path=None):
+        """Загружает сохранённую модель CatBoost"""
+        if model_path is None:
+            model_path = os.path.join(self.artifact_dir, "model_multi.cbm")
+        self.model = CatBoostRegressor()
+        self.model.load_model(model_path)
+        print(f"Модель загружена из {model_path}")
 
     def merge_candles_news(self, df: pd.DataFrame, news: pd.DataFrame):
         # Инициализируем колонки новостей
@@ -45,15 +48,17 @@ class AiForecast:
             ticker = row["ticker"]
             date = row["begin"].date()
 
-            correlate_news_mask = news["tickers"].str.split(",").apply(lambda lst: ticker in lst)
-            #correlate_news_mask = news["first_ticker"] == ticker
+            correlate_news_mask = (
+                news["tickers"].str.split(",").apply(lambda lst: ticker in lst)
+            )
+            # correlate_news_mask = news["first_ticker"] == ticker
             correlate_news = news[correlate_news_mask]
 
-            #print(ticker, len(correlate_news))
+            # print(ticker, len(correlate_news))
 
             # Новости за 1 день
             news_1d = correlate_news[correlate_news["publish_date"].dt.date == date]
-            #print(ticker, len(news_1d), '\n')
+            # print(ticker, len(news_1d), '\n')
 
             df.at[i, "news_count_1"] = len(news_1d)
             if len(news_1d) > 0:
@@ -102,48 +107,36 @@ class AiForecast:
 
         train_data = pd.concat(train_dfs, ignore_index=True)
 
-        # Доходность через 1 и 20 дней
-        train_data["R_t+1"] = train_data["close"].shift(-1) / train_data["close"] - 1
-        train_data["R_t+20"] = train_data["close"].shift(-20) / train_data["close"] - 1
-
-        # Убираем последние строки интервала, где shift создаёт NaN
-        train_data.dropna(subset=["R_t+1", "R_t+20"], inplace=True)
+        # создаем таргет на все горизонты
+        for i in range(1, 21):
+            train_data[f"R_t+{i}"] = (
+                train_data["close"].shift(-i) / train_data["close"] - 1
+            )
+        target_cols = [f"R_t+{i}" for i in range(1, 21)]
+        train_data.dropna(subset=target_cols, inplace=True)
 
         X = train_data[features]
-        y1 = train_data["R_t+1"]
-        y20 = train_data["R_t+20"]
+        y = train_data[target_cols]
 
-        X_train, X_val, y1_train, y1_val, y20_train, y20_val = train_test_split(
-            X, y1, y20, test_size=0.2, random_state=SEED
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=SEED
         )
 
-        # LightGBM параметры
-        lgb_params = {
-            "objective": "regression",
-            "metric": "rmse",
-            "random_state": SEED,
-            "n_estimators": 1000,
+        catboost_params = {
+            "iterations": 2000,
             "learning_rate": 0.05,
-            "num_leaves": 31,
-            "verbose": -1,
+            "depth": 6,
+            "loss_function": "MultiRMSE",  # для многовыходной регрессии
+            "eval_metric": "MultiRMSE",
+            "random_seed": SEED,
+            "verbose": 50,
         }
 
-        # Модель для R_t+1
-        self.model_1 = lgb.LGBMRegressor(**lgb_params)
-        self.model_1.fit(
-            X_train, y1_train, eval_set=[(X_val, y1_val)]
-        )  # , early_stopping_rounds=50, verbose=50)
-
-        # Модель для R_t+20
-        self.model_20 = lgb.LGBMRegressor(**lgb_params)
-        self.model_20.fit(
-            X_train, y20_train, eval_set=[(X_val, y20_val)]
-        )  # , early_stopping_rounds=50, verbose=50)
+        self.model = CatBoostRegressor(**catboost_params)
+        self.model.fit(X_train, y_train, eval_set=(X_val, y_val))
 
         os.makedirs(self.artifact_dir, exist_ok=True)
-
-        self.model_1.booster_.save_model(f"{self.artifact_dir}/model_1.txt")
-        self.model_20.booster_.save_model(f"{self.artifact_dir}/model_20.txt")
+        self.model.save_model(f"{self.artifact_dir}/model_multi.cbm")
 
     def predict(self, test_candles: pd.DataFrame, test_news: pd.DataFrame):
         print("====== Predicting ======")
@@ -162,25 +155,12 @@ class AiForecast:
         for ticker, group in candle_processor.candles.groupby("ticker"):
             candles = group.sort_values("begin").reset_index(drop=True)
             candles, features = candle_processor.add_price_features(candles)
-
             df = self.merge_candles_news(candles, news)
             last_row = df.iloc[-1:]
             X_test = last_row[features]
 
-            R1_pred = self.model_1.predict(X_test)[0]
-            R20_pred = self.model_20.predict(X_test)[0]
-
-            # Формируем все p1..p20 как линейную интерполяцию между R1 и R20
-            p_list = [
-                R1_pred * (i / 1)
-                if i == 1
-                else R1_pred + (R20_pred - R1_pred) * (i / 20)
-                for i in range(1, 21)
-            ]
-
-            submission_list.append([ticker] + p_list)
-
-        print(features)
+            preds = self.model.predict(X_test)[0]  # сразу массив из 20 элементов
+            submission_list.append([ticker] + list(preds))
 
         submission_df = pd.DataFrame(
             submission_list, columns=["ticker"] + [f"p{i}" for i in range(1, 21)]
@@ -211,10 +191,7 @@ if __name__ == "__main__":
         test_candles = pd.read_csv("data/candles_2.csv", parse_dates=["begin"])
         test_news = pd.read_csv("data/news_2.csv", parse_dates=["publish_date"])
 
-        ai_forecast.load_models(
-            model_1_path="artifacts/model_1.txt",
-            model_20_path="artifacts/model_20.txt",
-        )
+        ai_forecast.load_model()
 
         submission = ai_forecast.predict(
             test_candles=test_candles,

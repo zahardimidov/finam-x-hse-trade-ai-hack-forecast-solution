@@ -56,6 +56,8 @@ class CandleProcessor:
                 start = week.dates[0]
                 end = merged[-1].dates[-1]
 
+                merged[-1].dates.extend(week.dates)
+
                 if (start - end).days == 3:
                     merged[-1].dates.extend(week.dates)
                 else:
@@ -63,6 +65,9 @@ class CandleProcessor:
 
             interval_id = 0
             for interval_group in merged:
+                if len(interval_group.dates) < 30:
+                    continue
+
                 interval_id += 1
                 dates = interval_group.dates
 
@@ -78,19 +83,26 @@ class CandleProcessor:
     def add_price_features(cls, candles: pd.DataFrame) -> pd.DataFrame:
         # Функция для расчёта индикаторов по каждому тикеру
         def calc_features(tdf: pd.DataFrame) -> pd.DataFrame:
-            # Базовые доходности
-            tdf["return_1d"] = tdf["close"].pct_change()
-            tdf["log_return"] = np.log(tdf["close"]) - np.log(tdf["close"].shift(1))
+            tdf = tdf.sort_values("begin").reset_index(drop=True)
 
-            # Скользящие средние
-            for w in [3, 5, 10]:
+            # --- Доходности с лагами ---
+            for lag in [1, 2, 3, 5, 10, 20, 50, 100]:
+                tdf[f"return_lag_{lag}"] = tdf["close"].pct_change(lag)
+
+            # --- Скользящие средние и EMA ---
+            for w in [10, 20, 30, 50, 100, 130]:
                 tdf[f"SMA_{w}"] = tdf["close"].rolling(w).mean()
                 tdf[f"EMA_{w}"] = tdf["close"].ewm(span=w, adjust=False).mean()
 
-                tdf[f"volatility_{w}"] = tdf["return_1d"].rolling(w).std()
+            # --- Волатильность ---
+            for w in [10, 20, 50, 100]:
+                tdf[f"volatility_{w}"] = tdf["close"].pct_change().rolling(w).std()
+
+            # --- Моментум ---
+            for w in [5, 10, 20, 50, 100]:
                 tdf[f"momentum_{w}"] = tdf["close"].pct_change(w)
 
-            # RSI (Relative Strength Index)
+            # --- RSI ---
             def compute_rsi(series, window=14):
                 delta = series.diff()
                 up = np.where(delta > 0, delta, 0)
@@ -100,41 +112,46 @@ class CandleProcessor:
                 RS = roll_up / (roll_down + 1e-9)
                 return 100 - (100 / (1 + RS))
 
-            tdf["RSI_7"] = compute_rsi(tdf["close"], window=7)
+            for w in [14, 20, 30]:
+                tdf[f"RSI_{w}"] = compute_rsi(tdf["close"], window=w)
 
-            # MACD (EMA6 - EMA13) и сигнальная линия
-            EMA6 = tdf["close"].ewm(span=6, adjust=False).mean()
-            EMA13 = tdf["close"].ewm(span=13, adjust=False).mean()
-            tdf["MACD"] = EMA6 - EMA13
-            tdf["MACD_signal"] = tdf["MACD"].ewm(span=5, adjust=False).mean()
+            # --- MACD ---
+            ema_pairs = [(12, 26), (26, 52)]
+            for short_span, long_span in ema_pairs:
+                EMA_short = tdf["close"].ewm(span=short_span, adjust=False).mean()
+                EMA_long = tdf["close"].ewm(span=long_span, adjust=False).mean()
+                tdf[f"MACD_{short_span}_{long_span}"] = EMA_short - EMA_long
+                tdf[f"MACD_signal_{short_span}_{long_span}"] = tdf[f"MACD_{short_span}_{long_span}"].ewm(span=9, adjust=False).mean()
 
-             # Bollinger Bands (10-дневные)
-            sma10 = tdf["close"].rolling(10).mean()
-            std10 = tdf["close"].rolling(10).std()
-            tdf["bollinger_upper"] = sma10 + 2 * std10
-            tdf["bollinger_lower"] = sma10 - 2 * std10
-            tdf["bollinger_bandwidth"] = (tdf["bollinger_upper"] - tdf["bollinger_lower"]) / sma10
+            # --- Bollinger Bands ---
+            for w in [20, 50, 100]:
+                sma = tdf["close"].rolling(w).mean()
+                std = tdf["close"].rolling(w).std()
+                tdf[f"bollinger_upper_{w}"] = sma + 2 * std
+                tdf[f"bollinger_lower_{w}"] = sma - 2 * std
+                tdf[f"bollinger_bandwidth_{w}"] = (tdf[f"bollinger_upper_{w}"] - tdf[f"bollinger_lower_{w}"]) / sma
 
-            # ATR (Average True Range, 7 дней)
+            # --- ATR ---
             high_low = tdf["high"] - tdf["low"]
             high_close = np.abs(tdf["high"] - tdf["close"].shift())
             low_close = np.abs(tdf["low"] - tdf["close"].shift())
-            ranges = pd.concat([high_low, high_close, low_close], axis=1)
-            true_range = ranges.max(axis=1)
-            tdf["ATR_7"] = true_range.rolling(7).mean()
+            true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            for w in [14, 20, 50, 100]:
+                tdf[f"ATR_{w}"] = true_range.rolling(w).mean()
 
-            # Объемные признаки
-            for w in [3, 5, 10]:
+            # --- Объёмные признаки ---
+            for w in [5, 10, 20, 50, 100]:
                 tdf[f"volume_mean_{w}"] = tdf["volume"].rolling(w).mean()
                 tdf[f"volume_change_{w}"] = tdf["volume"].pct_change(w)
 
-            # Расстояние от скользящих средних (нормализованное)
-            for w in [3, 5]:
+            # --- Расстояние от скользящих средних ---
+            for w in [10, 20, 50, 100, 130]:
                 ma = tdf[f"SMA_{w}"]
                 tdf[f"distance_from_SMA_{w}"] = (tdf["close"] - ma) / ma
 
-            return tdf
+            tdf.fillna(0, inplace=True)
 
+            return tdf
 
         df = candles.sort_values(["ticker", "begin"]).copy()
 
